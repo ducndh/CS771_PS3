@@ -1,0 +1,22 @@
+# macOS cruft
+.DS_Store
+__MACOSX/
+
+# IDE files
+.idea/
+.vscode/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Project-specific ignores
+data/
+logs/
+results/
+*.pth.tar
