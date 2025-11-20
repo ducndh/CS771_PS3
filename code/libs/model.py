@@ -9,6 +9,7 @@ from torchvision.ops.boxes import batched_nms
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 # point generator
 from .point_generator import PointGenerator
@@ -70,7 +71,10 @@ class FCOSClassificationHead(nn.Module):
         Some re-arrangement of the outputs is often preferred for training / inference.
         You can choose to do it here, or in compute_loss / inference.
         """
-        return x
+        cls_logits = []
+        for feature in x:
+            cls_logits.append(self.cls_logits(self.conv(feature)))
+        return cls_logits
 
 
 class FCOSRegressionHead(nn.Module):
@@ -131,7 +135,13 @@ class FCOSRegressionHead(nn.Module):
         Some re-arrangement of the outputs is often preferred for training / inference.
         You can choose to do it here, or in compute_loss / inference.
         """
-        return x, x
+        bbox_reg = []
+        bbox_ctrness = []
+        for feature in x:
+            conv_out = self.conv(feature)
+            bbox_reg.append(self.bbox_reg(conv_out))
+            bbox_ctrness.append(self.bbox_ctrness(conv_out))
+        return bbox_reg, bbox_ctrness
 
 
 class FCOS(nn.Module):
@@ -375,6 +385,166 @@ class FCOS(nn.Module):
     def compute_loss(
         self, targets, points, strides, reg_range, cls_logits, reg_outputs, ctr_logits
     ):
+        num_levels = len(points)
+
+        all_labels = []
+        all_bbox_targets = []
+        all_ctr_targets = []
+
+        for level_idx in range(num_levels):
+            points_per_level = points[level_idx]
+            stride = strides[level_idx]
+            reg_range_per_level = reg_range[level_idx]
+
+            H, W = points_per_level.shape[:2]
+            points_flat = points_per_level.reshape(-1, 2)
+
+            labels_per_img = []
+            bbox_targets_per_img = []
+            ctr_targets_per_img = []
+
+            for img_idx, targets_per_img in enumerate(targets):
+                gt_boxes = targets_per_img["boxes"]
+                gt_labels = targets_per_img["labels"]
+
+                num_points = points_flat.size(0)
+                num_gt = gt_boxes.size(0)
+
+                if num_gt == 0:
+                    labels_per_img.append(torch.zeros(num_points, dtype=torch.int64, device=gt_boxes.device))
+                    bbox_targets_per_img.append(torch.zeros(num_points, 4, device=gt_boxes.device))
+                    ctr_targets_per_img.append(torch.zeros(num_points, device=gt_boxes.device))
+                    continue
+
+                points_expanded = points_flat.unsqueeze(1).expand(num_points, num_gt, 2)
+                gt_boxes_expanded = gt_boxes.unsqueeze(0).expand(num_points, num_gt, 4)
+
+                left = points_expanded[:, :, 0] - gt_boxes_expanded[:, :, 0]
+                top = points_expanded[:, :, 1] - gt_boxes_expanded[:, :, 1]
+                right = gt_boxes_expanded[:, :, 2] - points_expanded[:, :, 0]
+                bottom = gt_boxes_expanded[:, :, 3] - points_expanded[:, :, 1]
+
+                bbox_targets = torch.stack([left, top, right, bottom], dim=2)
+
+                is_in_boxes = bbox_targets.min(dim=2)[0] > 0
+
+                max_reg_targets = bbox_targets.max(dim=2)[0]
+                is_in_range = (max_reg_targets >= reg_range_per_level[0]) & (max_reg_targets <= reg_range_per_level[1])
+
+                is_valid = is_in_boxes & is_in_range
+
+                gt_cx = (gt_boxes[:, 0] + gt_boxes[:, 2]) / 2
+                gt_cy = (gt_boxes[:, 1] + gt_boxes[:, 3]) / 2
+                gt_centers = torch.stack([gt_cx, gt_cy], dim=1)
+
+                gt_centers_expanded = gt_centers.unsqueeze(0).expand(num_points, num_gt, 2)
+                center_dists = torch.norm(points_expanded - gt_centers_expanded, dim=2)
+
+                is_in_center = center_dists <= (self.center_sampling_radius * stride)
+
+                is_positive = is_valid & is_in_center
+
+                areas = (gt_boxes[:, 2] - gt_boxes[:, 0]) * (gt_boxes[:, 3] - gt_boxes[:, 1])
+                areas_expanded = areas.unsqueeze(0).expand(num_points, num_gt)
+                areas_expanded[~is_positive] = float('inf')
+
+                min_area_inds = areas_expanded.min(dim=1)[1]
+
+                labels = gt_labels[min_area_inds]
+                labels[areas_expanded.min(dim=1)[0] == float('inf')] = 0
+
+                bbox_targets_assigned = bbox_targets[torch.arange(num_points), min_area_inds]
+                bbox_targets_assigned = bbox_targets_assigned / stride
+
+                left_t = bbox_targets_assigned[:, 0]
+                top_t = bbox_targets_assigned[:, 1]
+                right_t = bbox_targets_assigned[:, 2]
+                bottom_t = bbox_targets_assigned[:, 3]
+
+                ctr_targets = torch.zeros_like(left_t)
+                pos_inds = labels > 0
+                if pos_inds.sum() > 0:
+                    ctr_targets[pos_inds] = torch.sqrt(
+                        (torch.min(left_t[pos_inds], right_t[pos_inds]) / (torch.max(left_t[pos_inds], right_t[pos_inds]) + 1e-8)) *
+                        (torch.min(top_t[pos_inds], bottom_t[pos_inds]) / (torch.max(top_t[pos_inds], bottom_t[pos_inds]) + 1e-8))
+                    )
+
+                labels_per_img.append(labels)
+                bbox_targets_per_img.append(bbox_targets_assigned)
+                ctr_targets_per_img.append(ctr_targets)
+
+            all_labels.append(torch.stack(labels_per_img))
+            all_bbox_targets.append(torch.stack(bbox_targets_per_img))
+            all_ctr_targets.append(torch.stack(ctr_targets_per_img))
+
+        cls_loss = torch.tensor(0.0, device=cls_logits[0].device)
+        reg_loss = torch.tensor(0.0, device=cls_logits[0].device)
+        ctr_loss = torch.tensor(0.0, device=cls_logits[0].device)
+        num_pos = 0
+
+        for level_idx in range(num_levels):
+            cls_logits_per_level = cls_logits[level_idx]
+            reg_outputs_per_level = reg_outputs[level_idx]
+            ctr_logits_per_level = ctr_logits[level_idx]
+
+            labels_per_level = all_labels[level_idx]
+            bbox_targets_per_level = all_bbox_targets[level_idx]
+            ctr_targets_per_level = all_ctr_targets[level_idx]
+
+            N, C, H, W = cls_logits_per_level.shape
+
+            cls_logits_flat = cls_logits_per_level.permute(0, 2, 3, 1).reshape(-1, C)
+            reg_outputs_flat = reg_outputs_per_level.permute(0, 2, 3, 1).reshape(-1, 4)
+            ctr_logits_flat = ctr_logits_per_level.permute(0, 2, 3, 1).reshape(-1)
+
+            labels_flat = labels_per_level.reshape(-1)
+            bbox_targets_flat = bbox_targets_per_level.reshape(-1, 4)
+            ctr_targets_flat = ctr_targets_per_level.reshape(-1)
+
+            cls_targets = torch.zeros_like(cls_logits_flat)
+            pos_mask = labels_flat > 0
+            cls_targets[pos_mask, labels_flat[pos_mask] - 1] = 1
+
+            cls_loss += sigmoid_focal_loss(cls_logits_flat, cls_targets, alpha=0.25, gamma=2.0, reduction='sum')
+
+            if pos_mask.sum() > 0:
+                points_per_level = points[level_idx].reshape(-1, 2)
+                points_flat = points_per_level.unsqueeze(0).expand(N, -1, -1).reshape(-1, 2)
+
+                stride = strides[level_idx]
+                reg_targets_pos = bbox_targets_flat[pos_mask] * stride
+                reg_outputs_pos = reg_outputs_flat[pos_mask] * stride
+                points_pos = points_flat[pos_mask]
+
+                pred_x1 = points_pos[:, 0] - reg_outputs_pos[:, 0]
+                pred_y1 = points_pos[:, 1] - reg_outputs_pos[:, 1]
+                pred_x2 = points_pos[:, 0] + reg_outputs_pos[:, 2]
+                pred_y2 = points_pos[:, 1] + reg_outputs_pos[:, 3]
+                pred_boxes = torch.stack([pred_x1, pred_y1, pred_x2, pred_y2], dim=1)
+
+                target_x1 = points_pos[:, 0] - reg_targets_pos[:, 0]
+                target_y1 = points_pos[:, 1] - reg_targets_pos[:, 1]
+                target_x2 = points_pos[:, 0] + reg_targets_pos[:, 2]
+                target_y2 = points_pos[:, 1] + reg_targets_pos[:, 3]
+                target_boxes = torch.stack([target_x1, target_y1, target_x2, target_y2], dim=1)
+
+                reg_loss += giou_loss(pred_boxes, target_boxes, reduction='sum')
+
+                ctr_logits_pos = ctr_logits_flat[pos_mask]
+                ctr_targets_pos = ctr_targets_flat[pos_mask]
+                ctr_loss += F.binary_cross_entropy_with_logits(ctr_logits_pos, ctr_targets_pos, reduction='sum')
+
+            num_pos += pos_mask.sum().item()
+
+        num_pos = max(num_pos, 1)
+
+        losses = {
+            "cls_loss": cls_loss / num_pos,
+            "reg_loss": reg_loss / num_pos,
+            "ctr_loss": ctr_loss / num_pos,
+            "final_loss": (cls_loss + reg_loss + ctr_loss) / num_pos,
+        }
+
         return losses
 
     """
@@ -414,4 +584,103 @@ class FCOS(nn.Module):
     def inference(
         self, points, strides, cls_logits, reg_outputs, ctr_logits, image_shapes
     ):
+        detections = []
+
+        for img_idx, image_shape in enumerate(image_shapes):
+            box_cls_per_image = [cls_logits_per_level[img_idx] for cls_logits_per_level in cls_logits]
+            box_reg_per_image = [reg_outputs_per_level[img_idx] for reg_outputs_per_level in reg_outputs]
+            box_ctr_per_image = [ctr_logits_per_level[img_idx] for ctr_logits_per_level in ctr_logits]
+
+            boxes_all = []
+            scores_all = []
+            labels_all = []
+
+            for level_idx, (box_cls, box_reg, box_ctr, points_per_level, stride) in enumerate(
+                zip(box_cls_per_image, box_reg_per_image, box_ctr_per_image, points, strides)
+            ):
+                C, H, W = box_cls.shape
+
+                box_cls = box_cls.permute(1, 2, 0).reshape(-1, C).sigmoid()
+                box_ctr = box_ctr.permute(1, 2, 0).reshape(-1, 1).sigmoid()
+                box_reg = box_reg.permute(1, 2, 0).reshape(-1, 4)
+
+                scores = torch.sqrt(box_cls * box_ctr)
+
+                max_scores, _ = scores.max(dim=1)
+                keep_idxs = max_scores > self.score_thresh
+
+                if keep_idxs.sum() == 0:
+                    continue
+
+                scores = scores[keep_idxs]
+                box_reg = box_reg[keep_idxs]
+
+                points_per_level = points_per_level.reshape(-1, 2)
+                points_filtered = points_per_level[keep_idxs]
+
+                topk_idxs = torch.topk(scores.max(dim=1)[0], min(self.topk_candidates, scores.size(0)))[1]
+                scores = scores[topk_idxs]
+                box_reg = box_reg[topk_idxs]
+                points_filtered = points_filtered[topk_idxs]
+
+                x_center = points_filtered[:, 0]
+                y_center = points_filtered[:, 1]
+
+                left = box_reg[:, 0] * stride
+                top = box_reg[:, 1] * stride
+                right = box_reg[:, 2] * stride
+                bottom = box_reg[:, 3] * stride
+
+                x1 = x_center - left
+                y1 = y_center - top
+                x2 = x_center + right
+                y2 = y_center + bottom
+
+                boxes = torch.stack([x1, y1, x2, y2], dim=1)
+
+                boxes[:, 0::2] = boxes[:, 0::2].clamp(min=0, max=image_shape[1])
+                boxes[:, 1::2] = boxes[:, 1::2].clamp(min=0, max=image_shape[0])
+
+                ws = boxes[:, 2] - boxes[:, 0]
+                hs = boxes[:, 3] - boxes[:, 1]
+                keep = (ws > 1.0) & (hs > 1.0)
+
+                if keep.sum() == 0:
+                    continue
+
+                boxes = boxes[keep]
+                scores = scores[keep]
+
+                num_candidates = scores.size(0)
+                labels = torch.arange(C, device=scores.device).unsqueeze(0).expand(num_candidates, C)
+
+                boxes = boxes.unsqueeze(1).expand(num_candidates, C, 4).reshape(-1, 4)
+                scores = scores.reshape(-1)
+                labels = labels.reshape(-1)
+
+                boxes_all.append(boxes)
+                scores_all.append(scores)
+                labels_all.append(labels)
+
+            if len(boxes_all) == 0:
+                detections.append({
+                    "boxes": torch.zeros((0, 4), device=cls_logits[0].device),
+                    "scores": torch.zeros(0, device=cls_logits[0].device),
+                    "labels": torch.zeros(0, dtype=torch.int64, device=cls_logits[0].device),
+                })
+                continue
+
+            boxes_all = torch.cat(boxes_all, dim=0)
+            scores_all = torch.cat(scores_all, dim=0)
+            labels_all = torch.cat(labels_all, dim=0)
+
+            keep = batched_nms(boxes_all, scores_all, labels_all, self.nms_thresh)
+            keep = keep[:self.detections_per_img]
+
+            detections.append({
+                "boxes": boxes_all[keep],
+                "scores": scores_all[keep],
+                "labels": labels_all[keep] + 1,
+            })
+
         return detections

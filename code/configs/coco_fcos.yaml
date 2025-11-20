@@ -1,0 +1,18 @@
+output_folder: "../logs"
+dataset:
+  name: "COCO"
+  train: "train"
+  test: "val"
+  img_folder: "../data/coco/images"
+  json_folder: "../data/coco/annotations"
+
+model:
+  backbone: "resnet18"
+  fpn_feats_dim: 128
+  backbone_freeze_bn: False
+  num_classes: 80
+
+opt:
+  epochs: 4
+  learning_rate: 0.02
+  warmup_epochs: 1

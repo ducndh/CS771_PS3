@@ -61,8 +61,8 @@ class PointGenerator(nn.Module):
             points = torch.arange(0, self.max_size, stride)
             points += 0.5 * stride
             grid_x, grid_y = torch.meshgrid(points, points, indexing="ij")
-            grids = torch.stack([grid_x, grid_y], dim=-1)
-            # size: H x W x 2 (height, width)
+            grids = torch.stack([grid_y, grid_x], dim=-1)
+            # size: H x W x 2 (x, y)
             points_list.append(grids)
 
         return BufferList(points_list)

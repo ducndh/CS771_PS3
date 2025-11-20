@@ -71,14 +71,35 @@ class VOCDetection(torchvision.datasets.CocoDetection):
         return img, target
 
 
+class COCODetection(torchvision.datasets.CocoDetection):
+    """
+    A simple dataset wrapper to load COCO data
+    """
+
+    def __init__(self, img_folder, ann_file, transforms):
+        super().__init__(img_folder, ann_file)
+        self._transforms = transforms
+
+    def __getitem__(self, idx):
+        img, target = super().__getitem__(idx)
+        image_id = self.ids[idx]
+        target = dict(image_id=image_id, annotations=target)
+        if self._transforms is not None:
+            img, target = self._transforms(img, target)
+        return img, target
+
+
 def build_dataset(name, split, img_folder, json_folder):
     """
-    Create VOC dataset with default transforms for training / inference.
+    Create VOC/COCO dataset with default transforms for training / inference.
     New datasets can be linked here.
     """
     if name == "VOC2007":
         assert split in ["trainval", "test"]
         is_training = split == "trainval"
+    elif name == "COCO":
+        assert split in ["train", "val"]
+        is_training = split == "train"
     else:
         print("Unsupported dataset")
         return None
@@ -92,6 +113,11 @@ def build_dataset(name, split, img_folder, json_folder):
         dataset = VOCDetection(
             img_folder, os.path.join(json_folder, split + ".json"), transforms
         )
+    elif name == "COCO":
+        ann_file = os.path.join(json_folder, f"instances_{split}2017.json")
+        img_folder_split = os.path.join(img_folder, f"{split}2017")
+        dataset = COCODetection(img_folder_split, ann_file, transforms)
+
     return dataset
 
 

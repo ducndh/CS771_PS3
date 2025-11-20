@@ -20,3 +20,6 @@ data/
 logs/
 results/
 *.pth.tar
+VOCdevkit/
+*.tar
+*.png
