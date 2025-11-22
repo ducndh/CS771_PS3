@@ -8,4 +8,7 @@ dataset:
 #opt:
 #  epochs: 8
 
+model:
+  backbone: resnet34
+
 # see config.py for more details

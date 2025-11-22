@@ -31,12 +31,26 @@ from libs import (
     save_checkpoint,
 )
 
+import torch.distributed.autograd as dist_autograd
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+from torch.distributed import init_process_group, destroy_process_group
+
+def ddp_setup():
+    acc = torch.accelerator.current_accelerator()
+    rank = int(os.environ["LOCAL_RANK"])
+    device: torch.device = torch.device(f"{acc}:{rank}")
+    backend = torch.distributed.get_default_backend_for_device(device)
+    init_process_group(backend=backend)
+    torch.accelerator.set_device_index(rank)
+    return rank
 
 ################################################################################
 def main(args):
     """main function that handles training"""
 
     """1. Load config / Setup folders"""
+    # rank = ddp_setup()
     # parse args
     args.start_epoch = 0
     if os.path.isfile(args.config):
@@ -73,7 +87,9 @@ def main(args):
 
     """3. create model, optimizer, and scheduler"""
     # model
-    model = FCOS(**cfg["model"]).to(torch.device(cfg["devices"][0]))
+    model = FCOS(**cfg["model"]).to(cfg["devices"][0])
+    # model = FCOS(**cfg["model"]).to(torch.device("cuda", rank))
+    # model = DDP(model, device_ids=[rank])
     # optimizer
     optimizer = build_optimizer(model, cfg["opt"])
     # schedule
@@ -140,20 +156,23 @@ def main(args):
         if ((epoch + 1) == max_epochs) or (
             (args.ckpt_freq > 0) and ((epoch + 1) % args.ckpt_freq == 0)
         ):
-            save_states = {
-                "epoch": epoch,
-                "state_dict": model.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "optimizer": optimizer.state_dict(),
-            }
-            is_final = (epoch + 1) == max_epochs
-            save_checkpoint(
-                save_states,
-                is_final,
-                file_folder=ckpt_folder,
-                file_name="epoch_{:03d}.pth.tar".format(epoch),
-            )
+            # if rank == 0:
+                save_states = {
+                    "epoch": epoch,
+                    "state_dict": model.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                }
+                is_final = (epoch + 1) == max_epochs
+                save_checkpoint(
+                    save_states,
+                    is_final,
+                    file_folder=ckpt_folder,
+                    file_name="epoch_{:03d}.pth.tar".format(epoch),
+                )
 
+    #     torch.distributed.barrier()
+    # destroy_process_group()
     # wrap up
     tb_writer.close()
     print("All done!")

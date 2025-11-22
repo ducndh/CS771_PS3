@@ -398,6 +398,7 @@ class FCOS(nn.Module):
 
             H, W = points_per_level.shape[:2]
             points_flat = points_per_level.reshape(-1, 2)
+            num_points = points_flat.size(0)
 
             labels_per_img = []
             bbox_targets_per_img = []
@@ -407,13 +408,19 @@ class FCOS(nn.Module):
                 gt_boxes = targets_per_img["boxes"]
                 gt_labels = targets_per_img["labels"]
 
-                num_points = points_flat.size(0)
                 num_gt = gt_boxes.size(0)
 
                 if num_gt == 0:
-                    labels_per_img.append(torch.zeros(num_points, dtype=torch.int64, device=gt_boxes.device))
-                    bbox_targets_per_img.append(torch.zeros(num_points, 4, device=gt_boxes.device))
-                    ctr_targets_per_img.append(torch.zeros(num_points, device=gt_boxes.device))
+                    device = gt_boxes.device if gt_boxes.numel() > 0 else points_flat.device
+                    labels = torch.full(
+                        (num_points,), -1, dtype=torch.int64, device=device
+                    )
+                    bbox_targets_assigned = torch.zeros(num_points, 4, device=device)
+                    ctr_targets = torch.zeros(num_points, device=device)
+
+                    labels_per_img.append(labels)
+                    bbox_targets_per_img.append(bbox_targets_assigned)
+                    ctr_targets_per_img.append(ctr_targets)
                     continue
 
                 points_expanded = points_flat.unsqueeze(1).expand(num_points, num_gt, 2)
@@ -433,27 +440,47 @@ class FCOS(nn.Module):
 
                 is_valid = is_in_boxes & is_in_range
 
-                gt_cx = (gt_boxes[:, 0] + gt_boxes[:, 2]) / 2
-                gt_cy = (gt_boxes[:, 1] + gt_boxes[:, 3]) / 2
-                gt_centers = torch.stack([gt_cx, gt_cy], dim=1)
+                gt_cx = (gt_boxes[:, 0] + gt_boxes[:, 2]) / 2.0
+                gt_cy = (gt_boxes[:, 1] + gt_boxes[:, 3]) / 2.0
 
-                gt_centers_expanded = gt_centers.unsqueeze(0).expand(num_points, num_gt, 2)
-                center_dists = torch.norm(points_expanded - gt_centers_expanded, dim=2)
+                radius = self.center_sampling_radius * stride  # scalar for this level
 
-                is_in_center = center_dists <= (self.center_sampling_radius * stride)
+                # square around center (before clipping by GT box)
+                xmin = gt_cx - radius
+                ymin = gt_cy - radius
+                xmax = gt_cx + radius
+                ymax = gt_cy + radius
+
+                xmin = torch.max(xmin, gt_boxes[:, 0])
+                ymin = torch.max(ymin, gt_boxes[:, 1])
+                xmax = torch.min(xmax, gt_boxes[:, 2])
+                ymax = torch.min(ymax, gt_boxes[:, 3])
+
+                xs = points_flat[:, 0][:, None]
+                ys = points_flat[:, 1][:, None]
+
+                left   = xs - xmin[None, :]
+                right  = xmax[None, :] - xs
+                top    = ys - ymin[None, :]
+                bottom = ymax[None, :] - ys
+
+                center_box = torch.stack([left, top, right, bottom], dim=2)  # (num_points, num_gt, 4)
+                is_in_center = center_box.min(dim=2)[0] > 0
 
                 is_positive = is_valid & is_in_center
-
+                
                 areas = (gt_boxes[:, 2] - gt_boxes[:, 0]) * (gt_boxes[:, 3] - gt_boxes[:, 1])
-                areas_expanded = areas.unsqueeze(0).expand(num_points, num_gt)
-                areas_expanded[~is_positive] = float('inf')
+                areas_expanded = areas.unsqueeze(0).expand(num_points, num_gt).clone()
+                areas_expanded[~is_positive] = float("inf")
+
 
                 min_area_inds = areas_expanded.min(dim=1)[1]
 
                 labels = gt_labels[min_area_inds]
-                labels[areas_expanded.min(dim=1)[0] == float('inf')] = 0
+                labels[areas_expanded.min(dim=1)[0] == float('inf')] = -1
 
                 bbox_targets_assigned = bbox_targets[torch.arange(num_points), min_area_inds]
+                bbox_targets_assigned[areas_expanded.min(dim=1)[0] == float("inf")] = 0
                 bbox_targets_assigned = bbox_targets_assigned / stride
 
                 left_t = bbox_targets_assigned[:, 0]
@@ -462,7 +489,7 @@ class FCOS(nn.Module):
                 bottom_t = bbox_targets_assigned[:, 3]
 
                 ctr_targets = torch.zeros_like(left_t)
-                pos_inds = labels > 0
+                pos_inds = labels >= 0
                 if pos_inds.sum() > 0:
                     ctr_targets[pos_inds] = torch.sqrt(
                         (torch.min(left_t[pos_inds], right_t[pos_inds]) / (torch.max(left_t[pos_inds], right_t[pos_inds]) + 1e-8)) *
@@ -502,8 +529,9 @@ class FCOS(nn.Module):
             ctr_targets_flat = ctr_targets_per_level.reshape(-1)
 
             cls_targets = torch.zeros_like(cls_logits_flat)
-            pos_mask = labels_flat > 0
-            cls_targets[pos_mask, labels_flat[pos_mask] - 1] = 1
+            pos_mask = labels_flat >= 0
+            if pos_mask.any():
+                cls_targets[pos_mask, labels_flat[pos_mask]] = 1.0
 
             cls_loss += sigmoid_focal_loss(cls_logits_flat, cls_targets, alpha=0.25, gamma=2.0, reduction='sum')
 
@@ -535,7 +563,7 @@ class FCOS(nn.Module):
                 ctr_loss += F.binary_cross_entropy_with_logits(ctr_logits_pos, ctr_targets_pos, reduction='sum')
 
             num_pos += pos_mask.sum().item()
-
+        # print(num_pos)
         num_pos = max(num_pos, 1)
 
         losses = {

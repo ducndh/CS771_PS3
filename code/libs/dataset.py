@@ -2,6 +2,7 @@ import os
 import random
 
 import numpy as np
+import copy
 
 import torch
 import torchvision
@@ -9,6 +10,7 @@ from torch.utils.data import DataLoader
 import torchvision.transforms as T
 
 from .transforms import Compose, ConvertAnnotations, RandomHorizontalFlip, ToTensor
+from torch.utils.data.distributed import DistributedSampler
 
 
 def trivial_batch_collator(batch):
@@ -79,10 +81,30 @@ class COCODetection(torchvision.datasets.CocoDetection):
     def __init__(self, img_folder, ann_file, transforms):
         super().__init__(img_folder, ann_file)
         self._transforms = transforms
+        self.label_ids = sorted(self.coco.getCatIds())
+        self.id_map, self.rev_id_map = self._convert_to_contiguous_ids()
+
+    def get_cls_names(self):
+        cats = self.coco.loadCats(self.label_ids)
+        nms=[cat['name'] for cat in cats]
+        return nms
+    
+    def _convert_to_contiguous_ids(self):
+        cnt = 1
+        d = {}
+        d_rev = {}
+        for id in self.label_ids:
+            d[id] = cnt
+            d_rev [cnt] = id
+            cnt += 1
+        return d, d_rev
 
     def __getitem__(self, idx):
-        img, target = super().__getitem__(idx)
+        img, t = super().__getitem__(idx)
+        target = copy.deepcopy(t)
         image_id = self.ids[idx]
+        for obj in target:
+            obj["category_id"] = self.id_map[obj["category_id"]]
         target = dict(image_id=image_id, annotations=target)
         if self._transforms is not None:
             img, target = self._transforms(img, target)
@@ -115,8 +137,8 @@ def build_dataset(name, split, img_folder, json_folder):
         )
     elif name == "COCO":
         ann_file = os.path.join(json_folder, f"instances_{split}2017.json")
-        img_folder_split = os.path.join(img_folder, f"{split}2017")
-        dataset = COCODetection(img_folder_split, ann_file, transforms)
+        # img_folder_split = os.path.join(img_folder, f"{split}2017")
+        dataset = COCODetection(img_folder, ann_file, transforms)
 
     return dataset
 
@@ -134,5 +156,6 @@ def build_dataloader(dataset, is_training, batch_size, num_workers):
         shuffle=is_training,
         drop_last=is_training,
         persistent_workers=True,
+        # sampler = DistributedSampler(dataset),
     )
     return loader

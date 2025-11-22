@@ -154,8 +154,12 @@ def evaluate(
             image_id = target["image_id"].item()
             boxes = convert_to_xywh(output["boxes"]).tolist()
             scores = output["scores"].tolist()
-            labels = output["labels"].tolist()
+            labels = output["labels"].clone().tolist()
             for box, score, label in zip(boxes, scores, labels):
+                if "COCO" in val_loader.dataset.coco.dataset.get("info", {}).get("description") \
+                    and "PASCAL" not in val_loader.dataset.coco.dataset.get("info", {}).get("description"):
+                    label = val_loader.dataset.rev_id_map[label]
+
                 det_results.append(
                     {
                         "image_id": image_id,
